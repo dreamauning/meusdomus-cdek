@@ -38,8 +38,8 @@ const app = express();
 app.use(cors()); // разрешаем сайту на другом домене обращаться к этому серверу
 
 // ===== ВАШИ ДАННЫЕ ОТ СДЭК =====
-const CDEK_CLIENT_ID = '69njnL5edOoLVVJucGkHuP63nTCOkirQ';
-const CDEK_CLIENT_SECRET = 'FvJZ9veCGdpasb01S5kVAPwnWJTAUdJU';
+const CDEK_CLIENT_ID = 'ВСТАВЬТЕ_Account_ЗДЕСЬ';
+const CDEK_CLIENT_SECRET = 'ВСТАВЬТЕ_Secure_password_ЗДЕСЬ';
 
 // боевой адрес СДЭК (ключи подтверждены как боевые — см. примечание выше)
 const CDEK_BASE_URL = 'https://api.cdek.ru/v2';
@@ -80,7 +80,11 @@ async function getCdekToken() {
 // ===== ПОИСК КОДА ГОРОДА ПО НАЗВАНИЮ =====
 async function findCityCode(cityName) {
   const token = await getCdekToken();
-  const url = `${CDEK_BASE_URL}/location/cities?country_codes=RU&city=${encodeURIComponent(cityName)}&size=1`;
+  // Берём НЕСКОЛЬКО кандидатов (не один!) и сами выбираем точное совпадение —
+  // раньше брался слепо первый результат (size=1), а СДЭК мог вернуть на первом
+  // месте не совсем тот населённый пункт (например, другую область с похожим
+  // названием), из-за чего показывались реальные, но не те пункты выдачи.
+  const url = `${CDEK_BASE_URL}/location/cities?country_codes=RU&city=${encodeURIComponent(cityName)}&size=20`;
 
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` }
@@ -92,7 +96,16 @@ async function findCityCode(cityName) {
   if (!Array.isArray(cities) || cities.length === 0) {
     return null; // город не найден в справочнике СДЭК
   }
-  return cities[0].code;
+
+  const normalizedTarget = cityName.trim().toLowerCase();
+  // 1) сначала ищем ТОЧНОЕ совпадение названия города
+  const exactMatch = cities.find((c) => (c.city || '').trim().toLowerCase() === normalizedTarget);
+  if (exactMatch) return exactMatch.code;
+
+  // 2) если точного нет — берём город с наибольшим населением (обычно это и есть
+  // основной, всем известный город, а не мелкий тёзка в другой области)
+  const byPopulation = cities.slice().sort((a, b) => (b.population || 0) - (a.population || 0));
+  return byPopulation[0].code;
 }
 
 // ===== ГЛАВНЫЙ ЭНДПОИНТ: РЕАЛЬНЫЕ ПУНКТЫ ВЫДАЧИ ПО ГОРОДУ =====
