@@ -1,0 +1,13 @@
+{
+  "name": "meusdomus-cdek",
+  "version": "1.0.0",
+  "main": "cdek-pickup-points-server.js",
+  "scripts": {
+    "start": "node cdek-pickup-points-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "cors": "^2.8.5"
+  }
+}
