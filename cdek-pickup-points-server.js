@@ -59,7 +59,7 @@ async function getCdekToken() {
   params.append('client_id', CDEK_CLIENT_ID);
   params.append('client_secret', CDEK_CLIENT_SECRET);
 
-  const response = await fetch(`${CDEK_BASE_URL}/oauth/token?parameters`, {
+  const response = await fetch(`${CDEK_BASE_URL}/oauth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params
