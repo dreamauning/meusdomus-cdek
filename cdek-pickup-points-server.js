@@ -38,8 +38,8 @@ const app = express();
 app.use(cors()); // разрешаем сайту на другом домене обращаться к этому серверу
 
 // ===== ВАШИ ДАННЫЕ ОТ СДЭК =====
-const CDEK_CLIENT_ID = 'ВСТАВЬТЕ_Account_ЗДЕСЬ';
-const CDEK_CLIENT_SECRET = 'ВСТАВЬТЕ_Secure_password_ЗДЕСЬ';
+const CDEK_CLIENT_ID = '69njnL5edOoLVVJucGkHuP63nTCOkirQ';
+const CDEK_CLIENT_SECRET = 'FvJZ9veCGdpasb01S5kVAPwnWJTAUdJU';
 
 // боевой адрес СДЭК (ключи подтверждены как боевые — см. примечание выше)
 const CDEK_BASE_URL = 'https://api.cdek.ru/v2';
