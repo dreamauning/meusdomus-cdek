@@ -223,20 +223,46 @@ app.get('/api/cdek-calculate', async (req, res) => {
 
     const calc = JSON.parse(rawText);
 
-    if (typeof calc.delivery_sum !== 'number') {
+    // ВАЖНО, НАЙДЕНА НАСТОЯЩАЯ ПРИЧИНА расхождения с личным кабинетом:
+    // ответ СДЭК содержит ДВА разных числа — delivery_sum (чистый тариф,
+    // без доплат) и total_sum (delivery_sum + обязательные доп. услуги,
+    // например упаковка) — именно total_sum совпадает с тем, что реально
+    // спишется и что показывает личный кабинет партнёра. Раньше здесь
+    // читался delivery_sum — заниженная база без доплат. Если по какой-то
+    // причине total_sum не пришёл (старый формат ответа, разовый сбой) —
+    // используем delivery_sum как запасной вариант, чтобы не сломать
+    // расчёт совсем, но обычный, ожидаемый случай — именно total_sum.
+    const finalSum = (typeof calc.total_sum === 'number') ? calc.total_sum : calc.delivery_sum;
+
+    if (typeof finalSum !== 'number') {
       // СДЭК ответил 200, но без реальной суммы — например, тариф
       // недоступен для этого направления. Честно говорим сайту, что не
       // получилось, чтобы он остался на приблизительной оценке, а не
       // показал 0 ₽ или мусорное значение.
-      console.error(`[cdek-calculate] СДЭК не вернул delivery_sum для города "${cityName}": ${rawText}`);
+      console.error(`[cdek-calculate] СДЭК не вернул ни total_sum, ни delivery_sum для города "${cityName}": ${rawText}`);
       return res.json({ found: false, error: 'Тариф недоступен для этого направления' });
     }
+
+    // ===== НАЦЕНКА НА ДОСТАВКУ (запас магазину) =====
+    // По просьбе заказчика: сайт показывает покупателю не голую
+    // себестоимость доставки от СДЭК, а с небольшой наценкой сверху —
+    // так магазин не работает "в ноль" при малейшей погрешности расчёта
+    // (габариты, объёмный вес и т.п. никогда не будут посчитаны идеально
+    // точно для абсолютно любой комбинации товаров в корзине).
+    // Наценка сделана ПРОЦЕНТОМ, а не фиксированной суммой — фиксированная
+    // добавка искажала бы пропорции: та же сумма и на дешёвую доставку по
+    // Москве, и на дорогую на Дальний Восток, что несправедливо и не имеет
+    // экономического смысла. 5% выбраны как понятное круглое число.
+    const CDEK_MARKUP_PERCENT = 5;
+    const realCost = finalSum;
+    const costWithMarkup = Math.round(realCost * (1 + CDEK_MARKUP_PERCENT / 100));
+    console.log(`[cdek-calculate] Реальная стоимость СДЭК: ${realCost} ₽ → с наценкой ${CDEK_MARKUP_PERCENT}%: ${costWithMarkup} ₽`);
 
     res.json({
       found: true,
       deliveryType: deliveryType,
       tariffCode: tariffCode,
-      cost: calc.delivery_sum,
+      cost: costWithMarkup,
       periodMinDays: calc.period_min,
       periodMaxDays: calc.period_max
     });
