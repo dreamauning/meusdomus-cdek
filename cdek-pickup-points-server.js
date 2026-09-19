@@ -272,6 +272,277 @@ app.get('/api/cdek-calculate', async (req, res) => {
   }
 });
 
+// Тот же адрес Google-скрипта, что используют сайт и сервер Ozon — нужен,
+// чтобы прочитать данные заказа и потом записать обратно настоящий
+// трек-номер СДЭК.
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+
+// Защита от повторного создания, если менеджер нажмёт ссылку дважды подряд,
+// не дожидаясь ответа (весь процесс с ожиданием трек-номера занимает до
+// 20+ секунд — вполне реальный сценарий для нетерпеливого клика). Это
+// простая защита "в памяти" именно этого сервера — не переживает
+// перезапуск, но для такого сценария (клик почти сразу же второй раз)
+// этого достаточно; настоящую защиту от дублей всё равно даёт проверка
+// order.trackNumber чуть ниже, эта же — просто более быстрый барьер.
+const ordersCurrentlyProcessing = new Set();
+
+// Координаты склада (2-я Фрезерная улица, 14) — те же, что использовались
+// при разовой настройке Ozon, для поиска ближайшего СВОЕГО пункта отгрузки.
+const WAREHOUSE_LAT = 55.739514;
+const WAREHOUSE_LNG = 37.746526;
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const toRad = (deg) => deg * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// ===== РАЗОВАЯ НАСТРОЙКА: СВОЙ ПУНКТ ОТГРУЗКИ (shipment_point) =====
+// Для тарифа "Посылка склад-склад" (136, доставка до ПВЗ) СДЭК ожидает
+// знать, ЧЕРЕЗ КАКОЙ ИМЕННО ваш пункт отгрузки идёт передача посылки —
+// аналогично тому, как это было нужно для Ozon. Без этого шага создание
+// заказа работать не будет вообще — сервер честно откажется, а не
+// сломается посередине (см. переменную CDEK_SHIPMENT_POINT ниже).
+const CDEK_SHIPMENT_POINT = null; // ← впишите сюда код ПВЗ после разовой настройки
+
+app.get('/api/setup/find-cdek-shipment-point', async (req, res) => {
+  try {
+    const cityCode = await findCityCode('Москва');
+    if (!cityCode) {
+      return res.status(500).json({ error: 'Не удалось найти код города Москва' });
+    }
+    const token = await getCdekToken();
+    const pointsUrl = `${CDEK_BASE_URL}/deliverypoints?city_code=${cityCode}&type=PVZ`;
+    const pointsResponse = await fetch(pointsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (!pointsResponse.ok) {
+      const text = await pointsResponse.text();
+      return res.status(500).json({ error: `СДЭК не отдал пункты (статус ${pointsResponse.status}): ${text}` });
+    }
+    const points = await pointsResponse.json();
+    const withDistance = (points || []).map(p => ({
+      code: p.code,
+      name: p.name,
+      address: p.location && p.location.address_full,
+      distanceKm: haversineKm(WAREHOUSE_LAT, WAREHOUSE_LNG, p.location && p.location.latitude, p.location && p.location.longitude)
+    })).sort((a, b) => a.distanceKm - b.distanceKm);
+
+    res.json({ nearest: withDistance.slice(0, 10) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ===== ОБЩИЙ ПОМОЩНИК ДЛЯ АВТОРИЗОВАННЫХ ЗАПРОСОВ К СДЭК =====
+async function cdekApiCall(method, endpoint, body) {
+  const token = await getCdekToken();
+  const options = {
+    method,
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+  };
+  if (body) options.body = JSON.stringify(body);
+  const response = await fetch(`${CDEK_BASE_URL}${endpoint}`, options);
+  const text = await response.text();
+  let json;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  if (!response.ok) {
+    const err = new Error(`СДЭК API ${endpoint} ответил статусом ${response.status}: ${text}`);
+    err.cdekResponse = json;
+    throw err;
+  }
+  return json;
+}
+
+async function fetchOrderFromSheet(orderNumber) {
+  const url = `${APPS_SCRIPT_URL}?action=order-lookup&orderNumber=${encodeURIComponent(orderNumber)}`;
+  const response = await fetch(url);
+  return await response.json();
+}
+
+async function writeTrackingToSheet(orderNumber, trackNumber) {
+  const response = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({ type: 'set-tracking', orderNumber, trackNumber })
+  });
+  return await response.json();
+}
+
+function htmlPage(title, bodyHtml) {
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>' + title + '</title>'
+    + '<style>'
+    + 'body{font-family:-apple-system,Arial,sans-serif; background:#F3F0EA; color:#2A1E15; padding:40px 20px; max-width:560px; margin:0 auto; line-height:1.6;}'
+    + 'h1{font-size:22px; margin-bottom:16px;}'
+    + '.card{background:#fff; border-radius:10px; padding:24px; box-shadow:0 2px 12px rgba(42,30,21,0.1);}'
+    + '.ok{color:#2E7D32;} .err{color:#A83C3C;}'
+    + 'a.btn{display:inline-block; margin-top:16px; background:#2A1E15; color:#fff; padding:12px 20px; border-radius:8px; text-decoration:none; font-weight:600;}'
+    + '</style></head><body><div class="card">' + bodyHtml + '</div></body></html>';
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+/* ==================== АВТОМАТИЧЕСКОЕ СОЗДАНИЕ НАСТОЯЩЕЙ ОТПРАВКИ СДЭК ====
+ * Полный аналог того, что уже сделано для Ozon — менеджер нажимает ссылку
+ * в Telegram, сервер сам регистрирует заказ у СДЭК, дожидается присвоения
+ * трек-номера, заказывает печать этикетки со штрихкодом и записывает
+ * трек-номер обратно в таблицу (это само по себе запускает письмо
+ * покупателю — та же цепочка, что и у обычного ручного ввода).
+ * Пока реализовано ТОЛЬКО для "СДЭК до ПВЗ" (тариф 136) — для "СДЭК до
+ * двери" нужна отдельная проверка курьерского забора, которую отдельно
+ * не изучали; такие заказы пока оформляются вручную, как раньше.
+ * ============================================================================ */
+app.get('/api/create-cdek-order', async (req, res) => {
+  const orderNumber = String(req.query.orderNumber || '').trim();
+  if (!orderNumber) {
+    return res.status(400).send(htmlPage('Ошибка', '<h1 class="err">Не передан номер заказа</h1>'));
+  }
+
+  if (!CDEK_SHIPMENT_POINT) {
+    console.error('[create-cdek-order] CDEK_SHIPMENT_POINT не настроен — см. инструкцию по разовой настройке');
+    return res.send(htmlPage('Не настроено', '<h1 class="err">Свой пункт отгрузки СДЭК ещё не настроен на сервере</h1><p>Нужна разовая настройка, обратитесь к разработчику.</p>'));
+  }
+
+  if (ordersCurrentlyProcessing.has(orderNumber)) {
+    return res.send(htmlPage('Уже обрабатывается', '<h1>Этот заказ уже создаётся</h1><p>Кто-то (возможно, вы сами секунду назад) уже нажал эту ссылку — процесс ещё не завершился. Подождите немного и обновите страницу с историей заказа, не нажимайте ссылку повторно.</p>'));
+  }
+  ordersCurrentlyProcessing.add(orderNumber);
+
+  try {
+    const order = await fetchOrderFromSheet(orderNumber);
+    if (!order.found) {
+      return res.send(htmlPage('Заказ не найден', '<h1 class="err">Заказ не найден</h1><p>' + (order.error || 'Проверьте номер заказа.') + '</p>'));
+    }
+    if (order.trackNumber) {
+      return res.send(htmlPage('Уже создано', '<h1>Отправка уже была создана ранее</h1><p>Трек-номер: <b>' + order.trackNumber + '</b></p>'));
+    }
+    if (!order.cdekDeliveryPointCode) {
+      return res.send(htmlPage('Не хватает данных', '<h1 class="err">У этого заказа не сохранён код ПВЗ СДЭК</h1><p>Заказ мог быть оформлен до подключения этой автоматизации — создайте отправку вручную в кабинете СДЭК.</p>'));
+    }
+
+    const phoneDigits = String(order.phone || '').replace(/\D/g, '');
+    const weightGrams = Number(order.weightGrams) || 500;
+    let lengthCm = 20, widthCm = 15, heightCm = 10;
+    if (order.dimensionsCm && typeof order.dimensionsCm === 'string' && order.dimensionsCm.indexOf('×') !== -1) {
+      const parts = order.dimensionsCm.split('×').map(n => parseInt(n, 10));
+      if (parts.length === 3 && parts.every(n => !isNaN(n))) { [lengthCm, widthCm, heightCm] = parts; }
+    }
+    const itemNames = (order.items || []).map(i => i.name).join(', ') || ('Заказ ' + orderNumber);
+
+    const createBody = {
+      type: 1, // "интернет-магазин"
+      number: orderNumber,
+      tariff_code: 136, // "Посылка склад-склад" — до ПВЗ
+      shipment_point: CDEK_SHIPMENT_POINT,
+      delivery_point: order.cdekDeliveryPointCode,
+      sender: { name: 'Meus Domus' },
+      recipient: {
+        name: order.name || 'Покупатель Meus Domus',
+        phones: [{ number: phoneDigits ? ('+' + phoneDigits) : '+70000000000' }]
+      },
+      packages: [{
+        number: orderNumber,
+        weight: weightGrams,
+        length: lengthCm, width: widthCm, height: heightCm,
+        items: (order.items || []).map((i, idx) => ({
+          ware_key: String(i.id || idx),
+          name: (i.name || 'Товар').slice(0, 255),
+          payment: { value: 0 }, // наложенный платёж не берём — оплата уже прошла на сайте
+          cost: Number(i.price) || 0,
+          weight: Math.round(weightGrams / Math.max((order.items || []).length, 1)),
+          amount: Number(i.qty) || 1
+        }))
+      }]
+    };
+
+    console.log('[create-cdek-order] Создаём заказ ' + orderNumber + ':', JSON.stringify(createBody));
+    const createResp = await cdekApiCall('POST', '/orders', createBody);
+    console.log('[create-cdek-order] Ответ orders:', JSON.stringify(createResp));
+
+    const orderUuid = createResp && createResp.entity && createResp.entity.uuid;
+    if (!orderUuid) {
+      return res.send(htmlPage('Ошибка создания', '<h1 class="err">СДЭК не создал заказ</h1><pre>' + JSON.stringify(createResp) + '</pre>'));
+    }
+
+    // СДЭК обрабатывает заказ асинхронно — трек-номер (cdek_number)
+    // появляется не мгновенно. Ждём до ~20 секунд, опрашивая статус.
+    let cdekNumber = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await sleep(2000);
+      const info = await cdekApiCall('GET', `/orders/${orderUuid}`);
+      if (info && info.entity && info.entity.cdek_number) {
+        cdekNumber = info.entity.cdek_number;
+        break;
+      }
+      // Если СДЭК уже сообщил об ошибке по заказу — не ждём зря все 20 секунд
+      if (info && info.entity && info.entity.statuses && info.entity.statuses.some(s => s.code === 'INVALID')) {
+        return res.send(htmlPage('Ошибка', '<h1 class="err">СДЭК отклонил заказ</h1><pre>' + JSON.stringify(info.entity.statuses) + '</pre>'));
+      }
+    }
+
+    if (!cdekNumber) {
+      // Не дождались — заказ всё равно создан на стороне СДЭК (uuid есть),
+      // просто трек-номер ещё не присвоен. Сообщаем менеджеру честно, не
+      // теряя сам факт создания заказа.
+      return res.send(htmlPage('Создано, трек ожидается',
+        '<h1>Заказ зарегистрирован у СДЭК</h1>'
+        + '<p>UUID заказа: <b>' + orderUuid + '</b></p>'
+        + '<p>Трек-номер ещё не присвоен СДЭК — это иногда занимает больше времени. Проверьте статус в личном кабинете СДЭК через несколько минут и впишите трек-номер в таблицу вручную, когда он появится.</p>'
+      ));
+    }
+
+    // Заказываем печать этикетки со штрихкодом — тоже асинхронный процесс
+    let labelBase64 = null;
+    try {
+      const barcodeCreate = await cdekApiCall('POST', '/print/barcodes', {
+        orders: [{ order_uuid: orderUuid }],
+        format: 'A6'
+      });
+      const barcodeUuid = barcodeCreate && barcodeCreate.entity && barcodeCreate.entity.uuid;
+      if (barcodeUuid) {
+        for (let attempt = 0; attempt < 8; attempt++) {
+          await sleep(2000);
+          const statusResp = await cdekApiCall('GET', `/print/barcodes/${barcodeUuid}`);
+          const statusCode = statusResp && statusResp.entity && statusResp.entity.statuses && statusResp.entity.statuses.slice(-1)[0] && statusResp.entity.statuses.slice(-1)[0].code;
+          if (statusCode === 'READY' || (statusResp && statusResp.entity && statusResp.entity.url)) {
+            const token = await getCdekToken();
+            const pdfUrl = (statusResp.entity && statusResp.entity.url) || `${CDEK_BASE_URL}/print/barcodes/${barcodeUuid}.pdf`;
+            const pdfResp = await fetch(pdfUrl, { headers: { Authorization: `Bearer ${token}` } });
+            if (pdfResp.ok) {
+              const arrayBuf = await pdfResp.arrayBuffer();
+              labelBase64 = Buffer.from(arrayBuf).toString('base64');
+            }
+            break;
+          }
+        }
+      }
+    } catch (labelErr) {
+      console.error('[create-cdek-order] Не удалось получить этикетку:', labelErr.message);
+      // не критично — сам заказ и трек-номер уже готовы, продолжаем без этикетки
+    }
+
+    await writeTrackingToSheet(orderNumber, cdekNumber);
+
+    let labelHtml = '<p>Этикетку не удалось получить автоматически — найдите заказ ' + cdekNumber + ' в личном кабинете СДЭК и распечатайте её оттуда.</p>';
+    if (labelBase64) {
+      labelHtml = '<a class="btn" href="data:application/pdf;base64,' + labelBase64 + '" download="cdek-' + cdekNumber + '.pdf">Скачать этикетку (PDF)</a>';
+    }
+
+    res.send(htmlPage('Готово',
+      '<h1 class="ok">Отправка создана</h1>'
+      + '<p>Трек-номер СДЭК: <b>' + cdekNumber + '</b></p>'
+      + '<p>Трек-номер записан в таблицу — покупателю уже отправлено письмо с ним.</p>'
+      + labelHtml
+    ));
+  } catch (err) {
+    console.error('[create-cdek-order] Ошибка:', err);
+    res.status(500).send(htmlPage('Ошибка', '<h1 class="err">Что-то пошло не так</h1><p>' + String(err.message || err) + '</p><p>Заказ ' + orderNumber + ' нужно будет создать вручную в кабинете СДЭК.</p>'));
+  } finally {
+    ordersCurrentlyProcessing.delete(orderNumber);
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Сервер пунктов выдачи и расчёта СДЭК запущен на порту ${PORT}`);
