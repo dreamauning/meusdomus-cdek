@@ -244,7 +244,6 @@ app.get('/api/create-cdek-order', async (req, res) => {
     return res.status(400).send(htmlPage('Ошибка', '<h1 class="err">Не передан номер заказа</h1>'));
   }
 
-
   if (ordersCurrentlyProcessing.has(orderNumber)) {
     return res.send(htmlPage('Уже обрабатывается', '<h1>Этот заказ уже создаётся</h1><p>Кто-то (возможно, вы сами секунду назад) уже нажал эту ссылку — процесс ещё не завершился. Подождите немного и обновите страницу с историей заказа, не нажимайте ссылку повторно.</p>'));
   }
@@ -258,8 +257,24 @@ app.get('/api/create-cdek-order', async (req, res) => {
     if (order.trackNumber) {
       return res.send(htmlPage('Уже создано', '<h1>Отправка уже была создана ранее</h1><p>Трек-номер: <b>' + order.trackNumber + '</b></p>'));
     }
-    if (!order.cdekDeliveryPointCode) {
+    const isDoor = String(order.delivery || '').indexOf('СДЭК до двери') !== -1;
+    if (!isDoor && !order.cdekDeliveryPointCode) {
       return res.send(htmlPage('Не хватает данных', '<h1 class="err">У этого заказа не сохранён код ПВЗ СДЭК</h1><p>Заказ мог быть оформлен до подключения этой автоматизации — создайте отправку вручную в кабинете СДЭК.</p>'));
+    }
+
+    let destination;
+    if (isDoor) {
+      const fullDestination = String(order.deliveryDestination || '');
+      const separatorIdx = fullDestination.indexOf(', ');
+      const cityName = separatorIdx > 0 ? fullDestination.slice(0, separatorIdx) : '';
+      const address = separatorIdx > 0 ? fullDestination.slice(separatorIdx + 2).trim() : '';
+      const cityCode = cityName ? await findCityCode(cityName) : null;
+      if (!cityCode || !address) {
+        return res.send(htmlPage('Не хватает данных', '<h1 class="err">Не удалось определить город или адрес доставки</h1><p>Адрес в заказе: ' + (fullDestination || '—') + '. Создайте отправку вручную в кабинете СДЭК.</p>'));
+      }
+      destination = { to_location: { code: cityCode, address: address } };
+    } else {
+      destination = { delivery_point: order.cdekDeliveryPointCode };
     }
 
     const phoneDigits = String(order.phone || '').replace(/\D/g, '');
@@ -269,7 +284,6 @@ app.get('/api/create-cdek-order', async (req, res) => {
       const parts = order.dimensionsCm.split('×').map(n => parseInt(n, 10));
       if (parts.length === 3 && parts.every(n => !isNaN(n))) { [lengthCm, widthCm, heightCm] = parts; }
     }
-    const itemNames = (order.items || []).map(i => i.name).join(', ') || ('Заказ ' + orderNumber);
 
     const orderItems = order.items || [];
     const totalUnits = orderItems.reduce((s, i) => s + (Number(i.qty) || 1), 0) || 1;
@@ -288,9 +302,9 @@ app.get('/api/create-cdek-order', async (req, res) => {
     const createBody = {
       type: 1,
       number: orderNumber,
-      tariff_code: 136,
+      tariff_code: isDoor ? CDEK_TARIFF_CODES.door : CDEK_TARIFF_CODES.pvz,
       shipment_point: CDEK_SHIPMENT_POINT,
-      delivery_point: order.cdekDeliveryPointCode,
+      ...destination,
       sender: { name: 'Meus Domus' },
       recipient: {
         name: order.name || 'Покупатель Meus Domus',
