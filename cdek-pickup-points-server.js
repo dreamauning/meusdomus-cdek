@@ -11,6 +11,7 @@ const CDEK_SHIPMENT_POINT = 'MSK2466';
 const CDEK_TARIFF_CODES = { pvz: 136, door: 137 };
 const CDEK_MARKUP_PERCENT = 5;
 const DEFAULT_PACKAGE_CM = { length: 20, width: 15, height: 10 };
+const CDEK_DEBUG_KEY = 'md-diag-5f81c2';
 
 const app = express();
 app.use(cors());
@@ -46,27 +47,62 @@ async function getCdekToken() {
   return cachedToken;
 }
 
-async function findCityCode(cityName) {
-  const token = await getCdekToken();
-  const url = `${CDEK_BASE_URL}/location/cities?country_codes=RU&city=${encodeURIComponent(cityName)}&size=20`;
+function normalizeText(text) {
+  return String(text || '').trim().toLowerCase().replace(/ё/g, 'е');
+}
 
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
+function cleanCityName(name) {
+  return normalizeText(name)
+    .replace(/^(г|город|пгт|рп|с|п|д|ст-ца|х|аул|село|поселок|деревня|станица)\.?\s+/, '')
+    .replace(/\s+(г|город)\.?$/, '');
+}
+
+function regionKey(region) {
+  const words = normalizeText(region).replace(/[^a-zа-я\s-]/g, ' ').split(/\s+/)
+    .filter(w => w && ['обл', 'область', 'респ', 'республика', 'край', 'ао', 'авт', 'автономный', 'округ', 'г'].indexOf(w) === -1);
+  return words[0] || '';
+}
+
+async function findCityCandidates(cityName) {
+  const token = await getCdekToken();
+  const url = `${CDEK_BASE_URL}/location/cities?country_codes=RU&city=${encodeURIComponent(cleanCityName(cityName))}&size=50`;
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!response.ok) {
     throw new Error(`Не удалось найти город "${cityName}" (статус ${response.status})`);
   }
   const cities = await response.json();
-  if (!Array.isArray(cities) || cities.length === 0) {
-    return null;
+  return Array.isArray(cities) ? cities : [];
+}
+
+function chooseCity(cities, cityName, region) {
+  if (!cities.length) return null;
+  const target = cleanCityName(cityName);
+  const exact = cities.filter(c => normalizeText(c.city) === target);
+  let pool = exact.length ? exact : cities;
+  const key = regionKey(region);
+  if (key) {
+    const inRegion = pool.filter(c => normalizeText(c.region).indexOf(key) !== -1);
+    if (inRegion.length) pool = inRegion;
   }
+  return pool.slice().sort((a, b) => (b.population || 0) - (a.population || 0))[0];
+}
 
-  const normalizedTarget = cityName.trim().toLowerCase();
-  const exactMatch = cities.find((c) => (c.city || '').trim().toLowerCase() === normalizedTarget);
-  if (exactMatch) return exactMatch.code;
+async function findCityCode(cityName, region) {
+  const city = chooseCity(await findCityCandidates(cityName), cityName, region);
+  return city ? city.code : null;
+}
 
-  const byPopulation = cities.slice().sort((a, b) => (b.population || 0) - (a.population || 0));
-  return byPopulation[0].code;
+async function fetchCityPoints(cityCode, type) {
+  const token = await getCdekToken();
+  const response = await fetch(`${CDEK_BASE_URL}/deliverypoints?city_code=${cityCode}&type=${type}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`СДЭК не отдал пункты выдачи (статус ${response.status}): ${text}`);
+  }
+  const points = await response.json();
+  return Array.isArray(points) ? points : [];
 }
 
 app.get('/api/cdek-points', async (req, res) => {
@@ -76,23 +112,12 @@ app.get('/api/cdek-points', async (req, res) => {
       return res.status(400).json({ error: 'Укажите город в параметре city' });
     }
 
-    const cityCode = await findCityCode(cityName);
+    const cityCode = await findCityCode(cityName, req.query.region);
     if (!cityCode) {
       return res.json([]);
     }
 
-    const token = await getCdekToken();
-    const pointsUrl = `${CDEK_BASE_URL}/deliverypoints?city_code=${cityCode}&type=PVZ`;
-    const pointsResponse = await fetch(pointsUrl, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    if (!pointsResponse.ok) {
-      const text = await pointsResponse.text();
-      throw new Error(`СДЭК не отдал пункты выдачи (статус ${pointsResponse.status}): ${text}`);
-    }
-
-    const cdekPoints = await pointsResponse.json();
+    const cdekPoints = await fetchCityPoints(cityCode, 'PVZ');
 
     const formatted = (cdekPoints || []).map((p) => ({
       id: 'cdek-' + p.code,
@@ -107,6 +132,31 @@ app.get('/api/cdek-points', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+app.get('/api/cdek-debug', async (req, res) => {
+  if (req.query.key !== CDEK_DEBUG_KEY) return res.status(403).json({ error: 'forbidden' });
+  const cityName = String(req.query.city || '').trim();
+  if (!cityName) return res.json({ error: 'Укажите city' });
+  try {
+    const candidates = await findCityCandidates(cityName);
+    const chosen = chooseCity(candidates, cityName, req.query.region);
+    const report = {
+      query: { city: cityName, cleaned: cleanCityName(cityName), region: req.query.region || '' },
+      candidates: candidates.slice(0, 15).map(c => ({ code: c.code, city: c.city, region: c.region, population: c.population || null })),
+      chosen: chosen ? { code: chosen.code, city: chosen.city, region: chosen.region } : null
+    };
+    if (chosen) {
+      const pvz = await fetchCityPoints(chosen.code, 'PVZ');
+      const postamats = await fetchCityPoints(chosen.code, 'POSTAMAT');
+      report.pvzCount = pvz.length;
+      report.postamatCount = postamats.length;
+      report.pvzExamples = pvz.slice(0, 3).map(p => p.location && p.location.address_full);
+    }
+    res.json(report);
+  } catch (err) {
+    res.json({ error: String(err.message || err) });
   }
 });
 
@@ -125,7 +175,7 @@ app.get('/api/cdek-calculate', async (req, res) => {
       return res.status(400).json({ error: 'Укажите город в параметре city' });
     }
 
-    const toCityCode = await findCityCode(cityName);
+    const toCityCode = await findCityCode(cityName, req.query.region);
     if (!toCityCode) {
       console.log(`[cdek-calculate] Город "${cityName}" не найден в справочнике СДЭК`);
       return res.json({ found: false });
