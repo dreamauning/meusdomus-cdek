@@ -275,6 +275,21 @@ async function writeTrackingToSheet(orderNumber, trackNumber) {
   return await response.json();
 }
 
+async function saveTrackingResultHtml(orderNumber, trackNumber) {
+  let result = null;
+  try {
+    result = await writeTrackingToSheet(orderNumber, trackNumber);
+  } catch (err) {
+    console.error('[tracking] Не удалось записать трек-номер ' + trackNumber + ' для ' + orderNumber + ':', err.message);
+  }
+  if (result && result.success) {
+    return '<p>Трек-номер записан в таблицу — покупателю отправлено письмо с ним.</p>';
+  }
+  const reason = result && result.error ? result.error : 'нет связи с таблицей';
+  console.error('[tracking] Таблица не приняла трек-номер ' + trackNumber + ' для ' + orderNumber + ':', reason);
+  return '<p class="err">Трек-номер не записался в таблицу (' + reason + '). Впишите <b>' + trackNumber + '</b> в колонку K заказа ' + orderNumber + ' вручную — покупатель получит письмо.</p>';
+}
+
 function htmlPage(title, bodyHtml) {
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>' + title + '</title>'
     + '<style>'
@@ -426,7 +441,7 @@ app.get('/api/create-cdek-order', async (req, res) => {
       console.error('[create-cdek-order] Не удалось получить этикетку:', labelErr.message);
     }
 
-    await writeTrackingToSheet(orderNumber, cdekNumber);
+    const savedToSheet = await saveTrackingResultHtml(orderNumber, cdekNumber);
 
     let labelHtml = '<p>Этикетку не удалось получить автоматически — найдите заказ ' + cdekNumber + ' в личном кабинете СДЭК и распечатайте её оттуда.</p>';
     if (labelBase64) {
@@ -436,7 +451,7 @@ app.get('/api/create-cdek-order', async (req, res) => {
     res.send(htmlPage('Готово',
       '<h1 class="ok">Отправка создана</h1>'
       + '<p>Трек-номер СДЭК: <b>' + cdekNumber + '</b></p>'
-      + '<p>Трек-номер записан в таблицу — покупателю уже отправлено письмо с ним.</p>'
+      + savedToSheet
       + labelHtml
     ));
   } catch (err) {
